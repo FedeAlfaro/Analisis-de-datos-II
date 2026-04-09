@@ -604,18 +604,20 @@ class DataExplorer:
             result = result.set_index("column")
 
         # Warn for columns with >5% outliers.
+        warn_threshold = 10
+        info_threshold = 5
         for rec in records:
-            if rec["pct_outliers"] > 10:
+            if rec["pct_outliers"] > warn_threshold:
                 self._warn(
                     f"Column '{rec['column']}' has {rec['pct_outliers']}% "
-                    f"outliers (>{10}%)",
+                    f"outliers (>{warn_threshold}%)",
                     severity="WARNING", category="outliers",
                     affected=rec["column"],
                 )
-            elif rec["pct_outliers"] > 5:
+            elif rec["pct_outliers"] > info_threshold:
                 self._warn(
                     f"Column '{rec['column']}' has {rec['pct_outliers']}% "
-                    f"outliers (>{5}%)",
+                    f"outliers (>{info_threshold}%)",
                     severity="INFO", category="outliers",
                     affected=rec["column"],
                 )
@@ -626,7 +628,7 @@ class DataExplorer:
         if not result.empty:
             self._print(result.to_string())
         else:
-            self._print("  No numeric columns to analyse.")
+            self._print("  No numeric columns to analyze.")
         return result
 
     # ------------------------------------------------------------------
