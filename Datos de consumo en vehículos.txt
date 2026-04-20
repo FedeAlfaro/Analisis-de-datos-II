@@ -1,0 +1,4 @@
+# Datos de consumo de vehículos
+
+https://github.com/web-dev-champ/Auto-mpg?tab=readme-ov-file
+https://archive.ics.uci.edu/dataset/9/auto+mpg
