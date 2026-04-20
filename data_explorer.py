@@ -1,12 +1,13 @@
-"""Data Explorer — Part 1 of a modular ML pipeline.
+"""Data Explorer — Part 1/2 of a modular ML pipeline.
 
 This module provides the ``DataExplorer`` class, a comprehensive exploratory
 data analysis (EDA) toolkit designed to integrate cleanly with downstream
 pipeline stages (data cleaning, feature engineering, model training).
 
-Every public method **returns** structured objects (DataFrames, dicts, Series)
-so that results can be consumed programmatically.  When ``verbose=True``
-(the default), human-readable summaries are also printed to stdout.
+Every public method returns structured objects (DataFrames, dicts, Series)
+or generates deterministic visual/report artifacts that can be consumed
+programmatically. When ``verbose=True`` (the default), human-readable
+summaries are also printed to stdout.
 
 Usage example
 -------------
@@ -15,6 +16,30 @@ Usage example
 >>> df = pd.read_csv("my_dataset.csv")
 >>> explorer = DataExplorer(df, target_col="label", id_col="id")
 >>> results = explorer.run_full_eda()
+
+Public API (high level)
+-----------------------
+Structural and quality diagnostics:
+- ``check_tidy_format``
+- ``get_structural_summary``
+- ``analyze_nulls``
+- ``analyze_duplicates``
+- ``analyze_target``
+- ``detect_low_variance``
+- ``detect_outliers``
+- ``generate_alert_summary``
+
+Correlation and distribution plots:
+- ``plot_correlation_heatmap``
+- ``plot_target_correlations``
+- ``plot_normality``
+- ``plot_scatter``
+- ``plot_scatter_vs_target``
+
+Reporting and integration:
+- ``generate_sweetviz_report``
+- ``get_pipeline_summary``
+- ``run_full_eda``
 
 Integration with the broader ML pipeline
 -----------------------------------------
@@ -28,7 +53,9 @@ strategies or the outlier DataFrame to apply capping/removal.
 from __future__ import annotations
 
 import re
+import traceback
 import warnings
+from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -148,6 +175,9 @@ class DataExplorer:
         # Internal store for alerts raised during analysis.
         self._alerts: list[dict[str, str]] = []
 
+        # Caches used by downstream integration summaries.
+        self._normality_results: pd.DataFrame | None = None
+
         # Parse known date columns.
         for col in self.date_cols:
             if col in self.df.columns:
@@ -195,6 +225,63 @@ class DataExplorer:
             ):
                 cols.append(col)
         return cols
+
+    def _get_grid_dims(self, n: int) -> tuple[int, int]:
+        """Compute subplot grid dimensions close to a 16:9 aspect ratio.
+
+        Args:
+            n: Number of subplot cells required.
+
+        Returns:
+            A tuple ``(n_rows, n_cols)`` with at least one column and with
+            columns capped at 4 for readability.
+
+        Raises:
+            ValueError: If ``n`` is not a positive integer.
+        """
+        if n <= 0:
+            raise ValueError("n must be a positive integer")
+
+        best_rows, best_cols = 1, 1
+        best_score = float("inf")
+
+        max_cols = min(4, n)
+        target_ratio = 16 / 9
+        for n_cols in range(1, max_cols + 1):
+            n_rows = int(np.ceil(n / n_cols))
+            ratio = n_cols / max(1, n_rows)
+            empty_slots = n_rows * n_cols - n
+            score = abs(ratio - target_ratio) + 0.12 * empty_slots
+            if score < best_score:
+                best_score = score
+                best_rows, best_cols = n_rows, n_cols
+
+        return best_rows, best_cols
+
+    def _get_figsize(
+        self,
+        n_rows: int,
+        n_cols: int,
+        cell_size: float = 4.0,
+    ) -> tuple[float, float]:
+        """Scale figure size from grid dimensions.
+
+        Args:
+            n_rows: Number of rows in the subplot grid.
+            n_cols: Number of columns in the subplot grid.
+            cell_size: Base inches per subplot cell.
+
+        Returns:
+            Figure size as ``(width, height)`` in inches.
+
+        Raises:
+            ValueError: If grid dimensions or cell size are non-positive.
+        """
+        if n_rows <= 0 or n_cols <= 0:
+            raise ValueError("n_rows and n_cols must be positive")
+        if cell_size <= 0:
+            raise ValueError("cell_size must be positive")
+        return float(n_cols * cell_size), float(n_rows * cell_size)
 
     # ------------------------------------------------------------------
     # Tidy format detection
@@ -812,6 +899,881 @@ class DataExplorer:
         return series
 
     # ------------------------------------------------------------------
+    # Normality analysis
+    # ------------------------------------------------------------------
+
+    def plot_normality(
+        self,
+        max_cols: int = 24,
+        alpha: float = 0.05,
+    ) -> pd.DataFrame:
+        """Evaluate and visualize normality for numeric features.
+
+        Args:
+            max_cols: Maximum number of numeric columns to plot/test.
+            alpha: Significance level used to classify normal vs non-normal.
+
+        Returns:
+            DataFrame with columns ``variable``, ``test_used``, ``statistic``,
+            ``p_value``, ``is_normal``, ``skewness``, and ``kurtosis``.
+
+        Raises:
+            ValueError: If ``max_cols`` is less than 1 or ``alpha`` invalid.
+        """
+        if max_cols < 1:
+            raise ValueError("max_cols must be >= 1")
+        if alpha <= 0 or alpha >= 1:
+            raise ValueError("alpha must be in (0, 1)")
+
+        try:
+            numeric = self._numeric_cols(exclude_id=True)
+            if not numeric:
+                self._warn(
+                    "No numeric columns available for normality analysis",
+                    severity="INFO",
+                    category="normality",
+                    affected="",
+                )
+                empty = pd.DataFrame(
+                    columns=[
+                        "variable",
+                        "test_used",
+                        "statistic",
+                        "p_value",
+                        "is_normal",
+                        "skewness",
+                        "kurtosis",
+                    ]
+                )
+                self._normality_results = empty
+                return empty
+
+            selected = list(numeric)
+            if len(selected) > max_cols:
+                variances = self.df[selected].var(numeric_only=True)
+                keep = variances.sort_values(ascending=False).head(max_cols).index
+                keep_set = set(keep)
+                excluded = [c for c in selected if c not in keep_set]
+                selected = list(keep)
+                self._warn(
+                    "Normality analysis limited by max_cols. Excluded columns: "
+                    f"{excluded}",
+                    severity="INFO",
+                    category="normality",
+                    affected=", ".join(excluded),
+                )
+
+            # Keep figures readable by plotting in chunks.
+            chunk_size = 8
+            results: list[dict[str, Any]] = []
+
+            for start in range(0, len(selected), chunk_size):
+                cols_chunk = selected[start:start + chunk_size]
+                n_vars = len(cols_chunk)
+                n_rows, n_cols = self._get_grid_dims(n_vars)
+
+                fig_rows = n_rows * 2
+                fig_size = self._get_figsize(fig_rows, n_cols, cell_size=3.8)
+                fig, axes = plt.subplots(fig_rows, n_cols, figsize=fig_size)
+                axes_arr = np.array(axes, dtype=object)
+                if axes_arr.ndim == 1:
+                    axes_arr = axes_arr.reshape(fig_rows, n_cols)
+
+                for idx, col in enumerate(cols_chunk):
+                    row = idx // n_cols
+                    col_pos = idx % n_cols
+                    ax_hist = axes_arr[row, col_pos]
+                    ax_qq = axes_arr[row + n_rows, col_pos]
+
+                    s = self.df[col].dropna()
+                    if len(s) < 8:
+                        ax_hist.text(
+                            0.5,
+                            0.5,
+                            "Insufficient data",
+                            ha="center",
+                            va="center",
+                            transform=ax_hist.transAxes,
+                        )
+                        ax_qq.text(
+                            0.5,
+                            0.5,
+                            "Insufficient data",
+                            ha="center",
+                            va="center",
+                            transform=ax_qq.transAxes,
+                        )
+                        for ax in (ax_hist, ax_qq):
+                            ax.set_xticks([])
+                            ax.set_yticks([])
+                        continue
+
+                    if len(s) <= 5000:
+                        test_name = "Shapiro"
+                        stat, p_val = stats.shapiro(s)
+                    else:
+                        test_name = "D'Agostino"
+                        stat, p_val = stats.normaltest(s)
+
+                    mu = float(s.mean())
+                    sigma = float(s.std())
+                    sigma = max(sigma, 1e-12)
+
+                    sns.histplot(
+                        s,
+                        kde=True,
+                        stat="density",
+                        bins="auto",
+                        color="#4C78A8",
+                        edgecolor="white",
+                        ax=ax_hist,
+                    )
+                    x_line = np.linspace(float(s.min()), float(s.max()), 200)
+                    normal_pdf = stats.norm.pdf(x_line, loc=mu, scale=sigma)
+                    ax_hist.plot(
+                        x_line,
+                        normal_pdf,
+                        linestyle="--",
+                        linewidth=2,
+                        color="#E45756",
+                        label="Normal fit",
+                    )
+                    ax_hist.legend(loc="best", fontsize=8)
+
+                    stats.probplot(s, dist="norm", plot=ax_qq)
+
+                    is_normal = bool(p_val >= alpha)
+                    title_color = "green" if is_normal else "red"
+                    title = f"{col} | {test_name} p={p_val:.3g}"
+                    ax_hist.set_title(title, color=title_color, fontsize=10)
+                    ax_qq.set_title(
+                        f"Q-Q: {col} | {test_name} p={p_val:.3g}",
+                        color=title_color,
+                        fontsize=10,
+                    )
+
+                    skewness = float(s.skew())
+                    kurtosis = float(s.kurtosis())
+                    results.append(
+                        {
+                            "variable": col,
+                            "test_used": test_name,
+                            "statistic": float(stat),
+                            "p_value": float(p_val),
+                            "is_normal": is_normal,
+                            "skewness": skewness,
+                            "kurtosis": kurtosis,
+                        }
+                    )
+
+                # Hide unused axes in both rows.
+                total_slots = n_rows * n_cols
+                for idx in range(n_vars, total_slots):
+                    row = idx // n_cols
+                    col_pos = idx % n_cols
+                    axes_arr[row, col_pos].axis("off")
+                    axes_arr[row + n_rows, col_pos].axis("off")
+
+                all_axes = axes_arr.ravel().tolist()
+                if any(len(str(c)) > 8 for c in cols_chunk):
+                    for ax in all_axes:
+                        for tick in ax.get_xticklabels():
+                            tick.set_rotation(35)
+                            tick.set_ha("right")
+
+                group_no = start // chunk_size + 1
+                n_groups = int(np.ceil(len(selected) / chunk_size))
+                fig.suptitle(
+                    f"Normality diagnostics — Group {group_no} of {n_groups}",
+                    fontsize=12,
+                )
+                plt.tight_layout()
+                plt.show()
+
+            result_df = pd.DataFrame(results)
+            if not result_df.empty:
+                failed = result_df.loc[~result_df["is_normal"], "variable"].tolist()
+                if failed:
+                    self._warn(
+                        "Columns failing normality: "
+                        f"{failed}. This may affect model assumptions.",
+                        severity="WARNING",
+                        category="normality",
+                        affected=", ".join(failed),
+                    )
+            self._normality_results = result_df
+            return result_df
+        except Exception as exc:  # noqa: BLE001
+            self._warn(
+                f"plot_normality failed and was skipped: {exc}",
+                severity="WARNING",
+                category="normality",
+                affected="",
+            )
+            return pd.DataFrame(
+                columns=[
+                    "variable",
+                    "test_used",
+                    "statistic",
+                    "p_value",
+                    "is_normal",
+                    "skewness",
+                    "kurtosis",
+                ]
+            )
+
+    # ------------------------------------------------------------------
+    # Scatter matrix analysis
+    # ------------------------------------------------------------------
+
+    def plot_scatter(
+        self,
+        max_features: int = 8,
+        sample_size: int = 2000,
+        alpha: float = 0.4,
+    ) -> None:
+        """Build pairplot-style scatter matrices with matplotlib.
+
+        Args:
+            max_features: Maximum number of features considered.
+            sample_size: Maximum rows used for plotting.
+            alpha: Base marker transparency.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: If parameters are out of valid ranges.
+        """
+        if max_features < 1:
+            raise ValueError("max_features must be >= 1")
+        if sample_size < 10:
+            raise ValueError("sample_size must be >= 10")
+        if alpha <= 0 or alpha > 1:
+            raise ValueError("alpha must be in (0, 1]")
+
+        try:
+            numeric = self._numeric_cols(exclude_id=True)
+            if self.target_col and self.target_col in numeric:
+                numeric = [c for c in numeric if c != self.target_col]
+
+            if len(numeric) < 2:
+                self._warn(
+                    "Fewer than 2 numeric columns available for scatter matrix",
+                    severity="WARNING",
+                    category="scatter",
+                    affected=", ".join(numeric),
+                )
+                return
+
+            target_exists = self.target_col and self.target_col in self.df.columns
+            target_is_numeric = False
+            if target_exists:
+                target_series = self.df[self.target_col]
+                target_is_numeric = (
+                    pd.api.types.is_numeric_dtype(target_series)
+                    and target_series.dropna().nunique() > 20
+                )
+
+            if target_exists and target_is_numeric:
+                corr_scores: dict[str, float] = {}
+                for col in numeric:
+                    valid = self.df[[col, self.target_col]].dropna()
+                    if len(valid) < 3:
+                        continue
+                    corr = valid[col].corr(valid[self.target_col])
+                    corr_scores[col] = float(abs(corr)) if pd.notna(corr) else 0.0
+                ranked = sorted(corr_scores, key=corr_scores.get, reverse=True)
+                features = ranked[:max_features]
+            else:
+                variances = self.df[numeric].var(numeric_only=True)
+                features = variances.sort_values(ascending=False).head(
+                    max_features
+                ).index.tolist()
+
+            if len(features) < 2:
+                self._warn(
+                    "Could not select at least 2 numeric features for scatter matrix",
+                    severity="WARNING",
+                    category="scatter",
+                    affected=", ".join(features),
+                )
+                return
+
+            plot_df = self.df.copy()
+            sampled = False
+            if len(plot_df) > sample_size:
+                plot_df = plot_df.sample(sample_size, random_state=42)
+                sampled = True
+
+            n_pts = len(plot_df)
+            if n_pts <= 500:
+                marker_size = 24
+                alpha_eff = max(alpha, 0.6)
+            elif n_pts <= 2000:
+                marker_size = 12
+                alpha_eff = alpha
+            else:
+                marker_size = 7
+                alpha_eff = min(alpha, 0.3)
+
+            groups: list[list[str]] = []
+            if max_features > 5 and len(features) > 5:
+                window = 5
+                step = 3
+                for i in range(0, len(features), step):
+                    group = features[i:i + window]
+                    if len(group) >= 2:
+                        groups.append(group)
+                    if i + window >= len(features):
+                        break
+            else:
+                groups = [features]
+
+            is_cat_target_small = False
+            if target_exists and not target_is_numeric:
+                is_cat_target_small = (
+                    plot_df[self.target_col].dropna().nunique() <= 10
+                )
+
+            for g_idx, group in enumerate(groups, start=1):
+                n = len(group)
+                fig, axes = plt.subplots(n, n, figsize=self._get_figsize(n, n, 3.0))
+                axes_arr = np.array(axes, dtype=object)
+                if axes_arr.ndim == 1:
+                    axes_arr = axes_arr.reshape(n, n)
+
+                color_values = None
+                cat_map: dict[Any, int] | None = None
+                if target_exists and target_is_numeric:
+                    color_values = plot_df[self.target_col]
+                elif target_exists and is_cat_target_small:
+                    classes = sorted(plot_df[self.target_col].dropna().unique())
+                    cat_map = {cls: i for i, cls in enumerate(classes)}
+                    color_values = plot_df[self.target_col].map(cat_map)
+
+                for i, y_col in enumerate(group):
+                    for j, x_col in enumerate(group):
+                        ax = axes_arr[i, j]
+                        if i == j:
+                            vals = plot_df[x_col].dropna().to_numpy()
+                            if len(vals) > 1 and np.std(vals) > 0:
+                                kde = stats.gaussian_kde(vals)
+                                x_grid = np.linspace(vals.min(), vals.max(), 200)
+                                ax.plot(x_grid, kde(x_grid), color="#4C78A8")
+                            else:
+                                ax.hist(vals, bins=20, color="#4C78A8")
+                        else:
+                            if target_exists and target_is_numeric:
+                                sc = ax.scatter(
+                                    plot_df[x_col],
+                                    plot_df[y_col],
+                                    c=color_values,
+                                    cmap="viridis",
+                                    s=marker_size,
+                                    alpha=alpha_eff,
+                                    linewidths=0,
+                                )
+                            elif target_exists and is_cat_target_small and cat_map:
+                                ax.scatter(
+                                    plot_df[x_col],
+                                    plot_df[y_col],
+                                    c=color_values,
+                                    cmap="tab10",
+                                    s=marker_size,
+                                    alpha=alpha_eff,
+                                    linewidths=0,
+                                )
+                            else:
+                                ax.scatter(
+                                    plot_df[x_col],
+                                    plot_df[y_col],
+                                    color="#4C78A8",
+                                    s=marker_size,
+                                    alpha=alpha_eff,
+                                    linewidths=0,
+                                )
+
+                        if i == n - 1:
+                            ax.set_xlabel(x_col)
+                        else:
+                            ax.set_xlabel("")
+                        if j == 0:
+                            ax.set_ylabel(y_col)
+                        else:
+                            ax.set_ylabel("")
+
+                title = "Scatter Matrix"
+                if len(groups) > 1:
+                    title += f" — Group {g_idx} of {len(groups)}"
+                if sampled:
+                    title += " (sampled)"
+                fig.suptitle(title, fontsize=13)
+
+                if target_exists and target_is_numeric:
+                    cbar = fig.colorbar(sc, ax=axes_arr.ravel().tolist(),
+                                        fraction=0.02, pad=0.01)
+                    cbar.set_label(str(self.target_col))
+                elif target_exists and is_cat_target_small and cat_map:
+                    handles = [
+                        plt.Line2D(
+                            [0],
+                            [0],
+                            marker="o",
+                            linestyle="",
+                            label=str(cls),
+                            markerfacecolor=plt.get_cmap("tab10")(idx),
+                            markeredgecolor="none",
+                            markersize=7,
+                        )
+                        for cls, idx in cat_map.items()
+                    ]
+                    fig.legend(handles=handles, title=str(self.target_col),
+                               loc="upper right")
+
+                if any(len(str(name)) > 8 for name in group):
+                    for ax in axes_arr.ravel().tolist():
+                        for tick in ax.get_xticklabels():
+                            tick.set_rotation(35)
+                            tick.set_ha("right")
+
+                plt.tight_layout()
+                plt.show()
+        except Exception as exc:  # noqa: BLE001
+            self._warn(
+                f"plot_scatter failed and was skipped: {exc}",
+                severity="WARNING",
+                category="scatter",
+                affected="",
+            )
+
+    # ------------------------------------------------------------------
+    # Scatter vs target
+    # ------------------------------------------------------------------
+
+    def plot_scatter_vs_target(
+        self,
+        top_n: int = 12,
+        sample_size: int = 3000,
+    ) -> None:
+        """Plot individual feature-vs-target scatter panels.
+
+        Args:
+            top_n: Number of top associated numeric features to visualize.
+            sample_size: Maximum rows used for plotting.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: If ``top_n`` or ``sample_size`` are invalid.
+        """
+        if top_n < 1:
+            raise ValueError("top_n must be >= 1")
+        if sample_size < 10:
+            raise ValueError("sample_size must be >= 10")
+
+        try:
+            if not self.target_col or self.target_col not in self.df.columns:
+                self._print("\n=== Scatter vs Target ===")
+                self._print("  No target column specified; skipping.")
+                return
+
+            target = self.df[self.target_col]
+            numeric_features = self._numeric_cols(exclude_id=True)
+            numeric_features = [
+                c for c in numeric_features if c != self.target_col
+            ]
+
+            if not numeric_features:
+                self._warn(
+                    "No numeric features available for scatter-vs-target plot",
+                    severity="INFO",
+                    category="scatter_vs_target",
+                    affected="",
+                )
+                return
+
+            target_is_numeric = (
+                pd.api.types.is_numeric_dtype(target)
+                and target.dropna().nunique() > 20
+            )
+
+            scores: dict[str, float] = {}
+            if target_is_numeric:
+                for col in numeric_features:
+                    valid = self.df[[col, self.target_col]].dropna()
+                    if len(valid) < 3:
+                        continue
+                    corr = valid[col].corr(valid[self.target_col])
+                    scores[col] = float(abs(corr)) if pd.notna(corr) else 0.0
+            else:
+                variances = self.df[numeric_features].var(numeric_only=True)
+                scores = variances.to_dict()
+
+            selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
+            if not selected:
+                self._warn(
+                    "Could not compute feature scores for scatter-vs-target",
+                    severity="INFO",
+                    category="scatter_vs_target",
+                    affected="",
+                )
+                return
+
+            plot_df = self.df[selected + [self.target_col]].copy()
+            if len(plot_df) > sample_size:
+                plot_df = plot_df.sample(sample_size, random_state=42)
+
+            n_rows, n_cols = self._get_grid_dims(len(selected))
+            fig, axes = plt.subplots(
+                n_rows,
+                n_cols,
+                figsize=self._get_figsize(n_rows, n_cols, cell_size=4.1),
+            )
+            axes_arr = np.array(axes, dtype=object)
+            if axes_arr.ndim == 0:
+                axes_arr = axes_arr.reshape(1)
+            axes_flat = axes_arr.ravel().tolist()
+
+            class_map: dict[Any, int] = {}
+            if not target_is_numeric:
+                classes = sorted(plot_df[self.target_col].dropna().unique())
+                class_map = {c: i for i, c in enumerate(classes)}
+
+            for i, feat in enumerate(selected):
+                ax = axes_flat[i]
+
+                valid = plot_df[[feat, self.target_col]].dropna()
+                if valid.empty:
+                    ax.text(0.5, 0.5, "No data", transform=ax.transAxes,
+                            ha="center", va="center")
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    continue
+
+                x = valid[feat].to_numpy(dtype=float)
+
+                if target_is_numeric:
+                    y = valid[self.target_col].to_numpy(dtype=float)
+                    ax.scatter(x, y, s=13, alpha=0.45, color="#4C78A8")
+
+                    if len(x) > 2 and np.std(x) > 0:
+                        slope, intercept = np.polyfit(x, y, deg=1)
+                        x_line = np.linspace(np.min(x), np.max(x), 200)
+                        y_line = slope * x_line + intercept
+                        y_hat = slope * x + intercept
+                        resid = y - y_hat
+                        s_err = np.sqrt(np.sum(resid ** 2) / max(len(x) - 2, 1))
+                        x_center = np.mean(x)
+                        denom = np.sum((x - x_center) ** 2)
+                        if denom > 0:
+                            conf = 1.96 * s_err * np.sqrt(
+                                1 / len(x) + (x_line - x_center) ** 2 / denom
+                            )
+                            ax.fill_between(
+                                x_line,
+                                y_line - conf,
+                                y_line + conf,
+                                color="#72B7B2",
+                                alpha=0.2,
+                            )
+                        ax.plot(x_line, y_line, color="#E45756", linewidth=2)
+                    corr_val = np.corrcoef(x, y)[0, 1] if len(x) > 1 else np.nan
+                    ax.set_ylabel(str(self.target_col))
+                else:
+                    y_enc = valid[self.target_col].map(class_map).to_numpy(float)
+                    jitter = np.random.default_rng(42).normal(0, 0.08, size=len(y_enc))
+                    y = y_enc + jitter
+                    ax.scatter(
+                        x,
+                        y,
+                        c=y_enc,
+                        cmap="tab10",
+                        s=13,
+                        alpha=0.5,
+                    )
+                    corr_val = (
+                        np.corrcoef(x, y_enc)[0, 1] if len(x) > 1 else np.nan
+                    )
+                    ax.set_yticks(list(class_map.values()))
+                    ax.set_yticklabels([str(c) for c in class_map.keys()])
+                    ax.set_ylabel(str(self.target_col))
+
+                ax.set_xlabel(feat)
+                title_corr = f"{corr_val:.2f}" if pd.notna(corr_val) else "nan"
+                ax.set_title(f"{feat} | r = {title_corr}")
+
+                if len(str(feat)) > 8:
+                    for tick in ax.get_xticklabels():
+                        tick.set_rotation(35)
+                        tick.set_ha("right")
+
+            for j in range(len(selected), len(axes_flat)):
+                axes_flat[j].axis("off")
+
+            plt.tight_layout()
+            plt.show()
+        except Exception as exc:  # noqa: BLE001
+            self._warn(
+                f"plot_scatter_vs_target failed and was skipped: {exc}",
+                severity="WARNING",
+                category="scatter_vs_target",
+                affected="",
+            )
+
+    # ------------------------------------------------------------------
+    # Sweetviz report
+    # ------------------------------------------------------------------
+
+    def generate_sweetviz_report(
+        self,
+        output_path: str = "eda_report.html",
+        compare_by_target: bool = False,
+        max_features: int = 50,
+        sample_size: int | None = None,
+    ) -> None:
+        """Generate a Sweetviz HTML report safely.
+
+        Args:
+            output_path: Destination HTML file path.
+            compare_by_target: Whether to run intra-target comparison mode.
+            max_features: Maximum number of columns used in the report.
+            sample_size: Optional explicit row sample size.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: If ``max_features`` or ``sample_size`` are invalid.
+        """
+        if max_features < 1:
+            raise ValueError("max_features must be >= 1")
+        if sample_size is not None and sample_size < 100:
+            raise ValueError("sample_size must be >= 100 when provided")
+
+        df_report = self.df.copy()
+
+        if df_report.shape[1] > max_features:
+            must_keep = {
+                c
+                for c in [self.id_col, self.target_col]
+                if c and c in df_report.columns
+            }
+            remaining = [c for c in df_report.columns if c not in must_keep]
+            n_to_sample = max_features - len(must_keep)
+            n_to_sample = max(n_to_sample, 0)
+
+            sampled_cols = []
+            if n_to_sample > 0 and remaining:
+                rng = np.random.default_rng(42)
+                sampled_cols = rng.choice(
+                    remaining,
+                    size=min(n_to_sample, len(remaining)),
+                    replace=False,
+                ).tolist()
+
+            keep_cols = [
+                c for c in df_report.columns if c in must_keep or c in sampled_cols
+            ]
+            excluded = [c for c in df_report.columns if c not in keep_cols]
+            df_report = df_report[keep_cols]
+            self._warn(
+                "Sweetviz limited by max_features. Excluded columns: "
+                f"{excluded}",
+                severity="INFO",
+                category="sweetviz",
+                affected=", ".join(excluded),
+            )
+
+        auto_sample = sample_size is None and len(df_report) > 100_000
+        if sample_size is not None or auto_sample:
+            n_rows = sample_size if sample_size is not None else 50_000
+            n_rows = min(n_rows, len(df_report))
+            if n_rows < len(df_report):
+                df_report = df_report.sample(n_rows, random_state=42)
+                self._warn(
+                    f"Sweetviz report generated on a {n_rows}-row sample.",
+                    severity="INFO",
+                    category="sweetviz",
+                    affected="",
+                )
+
+        try:
+            import sweetviz as sv
+        except ImportError:
+            self._print(
+                "Sweetviz is not installed. Install with: pip install sweetviz"
+            )
+            return
+
+        try:
+            report = None
+            target_ok = (
+                self.target_col
+                and self.target_col in df_report.columns
+            )
+
+            if not target_ok:
+                report = sv.analyze(df_report)
+            else:
+                target = df_report[self.target_col]
+                target_is_continuous = (
+                    pd.api.types.is_numeric_dtype(target)
+                    and target.dropna().nunique() > 20
+                )
+
+                if compare_by_target:
+                    if target_is_continuous:
+                        self._warn(
+                            "compare_by_target=True requires a binary/"
+                            "categorical target. Falling back to analyze "
+                            "with target feature.",
+                            severity="WARNING",
+                            category="sweetviz",
+                            affected=self.target_col,
+                        )
+                        report = sv.analyze(df_report, target_feat=self.target_col)
+                    else:
+                        value = target.dropna().iloc[0] if target.notna().any() else None
+                        if value is None:
+                            report = sv.analyze(df_report, target_feat=self.target_col)
+                        else:
+                            report = sv.compare_intra(
+                                df_report,
+                                df_report[self.target_col] == value,
+                                self.target_col,
+                            )
+                else:
+                    report = sv.analyze(df_report, target_feat=self.target_col)
+
+            resolved = str(Path(output_path).expanduser().resolve())
+            report.show_html(filepath=resolved, open_browser=False)
+            self._print(f"Sweetviz report saved to: {resolved}")
+        except Exception as exc:  # noqa: BLE001
+            self._print(f"Sweetviz generation failed: {exc}")
+            self._print(traceback.format_exc())
+
+    # ------------------------------------------------------------------
+    # Integration summary
+    # ------------------------------------------------------------------
+
+    def get_pipeline_summary(self) -> dict[str, Any]:
+        """Create a standardized summary dict for downstream modules.
+
+        Args:
+            None.
+
+        Returns:
+            Dictionary with shape, schema slices, quality indicators,
+            alert summary, and metadata keys expected by the next module.
+
+        Raises:
+            None.
+        """
+        try:
+            df = self.df
+            n_rows, n_cols = df.shape
+
+            null_columns = df.columns[df.isnull().any()].tolist()
+            high_null_columns = df.columns[(df.isnull().mean() > 0.30)].tolist()
+
+            numeric_cols = self._numeric_cols(exclude_id=False)
+            boolean_cols = df.select_dtypes(include="bool").columns.tolist()
+            datetime_cols = df.select_dtypes(include="datetime").columns.tolist()
+
+            categorical_cols: list[str] = []
+            freetext_cols: list[str] = []
+            for col in df.columns:
+                if col in numeric_cols or col in boolean_cols or col in datetime_cols:
+                    continue
+                if df[col].dtype.name == "category":
+                    categorical_cols.append(col)
+                elif df[col].dtype == object:
+                    nunique = df[col].nunique(dropna=True)
+                    n_nonnull = max(df[col].count(), 1)
+                    if nunique / n_nonnull > 0.5:
+                        freetext_cols.append(col)
+                    else:
+                        categorical_cols.append(col)
+
+            low_variance_cols = self.detect_low_variance()
+
+            outlier_df = self.detect_outliers()
+            outlier_cols: list[str] = []
+            if not outlier_df.empty and "pct_outliers" in outlier_df.columns:
+                outlier_cols = outlier_df.index[
+                    outlier_df["pct_outliers"] > 5
+                ].tolist()
+
+            if self._normality_results is None:
+                self._normality_results = self.plot_normality()
+            non_normal_cols: list[str] = []
+            if (
+                self._normality_results is not None
+                and not self._normality_results.empty
+                and "is_normal" in self._normality_results.columns
+            ):
+                non_normal_cols = self._normality_results.loc[
+                    ~self._normality_results["is_normal"], "variable"
+                ].tolist()
+
+            duplicate_info = self.analyze_duplicates()
+            duplicate_rows = int(duplicate_info.get("full_duplicates", 0))
+            duplicate_ids = duplicate_info.get("duplicated_ids")
+
+            tidy_result = self.check_tidy_format()
+            is_tidy = bool(tidy_result.get("is_tidy", False))
+
+            alerts = self.generate_alert_summary()
+
+            return {
+                "shape": (n_rows, n_cols),
+                "null_columns": null_columns,
+                "high_null_columns": high_null_columns,
+                "numeric_cols": numeric_cols,
+                "categorical_cols": categorical_cols,
+                "datetime_cols": datetime_cols,
+                "boolean_cols": boolean_cols,
+                "freetext_cols": freetext_cols,
+                "low_variance_cols": low_variance_cols,
+                "outlier_cols": outlier_cols,
+                "non_normal_cols": non_normal_cols,
+                "duplicate_rows": duplicate_rows,
+                "duplicate_ids": duplicate_ids,
+                "target_col": self.target_col,
+                "id_col": self.id_col,
+                "is_tidy": is_tidy,
+                "alerts": alerts,
+            }
+        except Exception as exc:  # noqa: BLE001
+            self._warn(
+                f"get_pipeline_summary failed and returned fallback values: {exc}",
+                severity="WARNING",
+                category="pipeline_summary",
+                affected="",
+            )
+            return {
+                "shape": tuple(self.df.shape),
+                "null_columns": [],
+                "high_null_columns": [],
+                "numeric_cols": [],
+                "categorical_cols": [],
+                "datetime_cols": [],
+                "boolean_cols": [],
+                "freetext_cols": [],
+                "low_variance_cols": [],
+                "outlier_cols": [],
+                "non_normal_cols": [],
+                "duplicate_rows": 0,
+                "duplicate_ids": None,
+                "target_col": self.target_col,
+                "id_col": self.id_col,
+                "is_tidy": False,
+                "alerts": self.generate_alert_summary(),
+            }
+
+    # ------------------------------------------------------------------
     # Executive alert summary
     # ------------------------------------------------------------------
 
@@ -849,8 +1811,14 @@ class DataExplorer:
     def run_full_eda(self) -> dict[str, Any]:
         """Execute all analysis steps and return consolidated results.
 
+        Args:
+            None.
+
         Returns:
             A dict keyed by method name with the output of each step.
+
+        Raises:
+            None.
         """
         results: dict[str, Any] = {}
 
@@ -861,6 +1829,12 @@ class DataExplorer:
         results["target_analysis"] = self.analyze_target()
         results["low_variance"] = self.detect_low_variance()
         results["outlier_detection"] = self.detect_outliers()
+
+        try:
+            results["normality"] = self.plot_normality()
+        except Exception:  # noqa: BLE001
+            results["normality"] = pd.DataFrame()
+            self._print("  (Skipped normality analysis due to an error)")
 
         # Plotting — wrapped in try/except to avoid breaking headless envs.
         try:
@@ -876,7 +1850,36 @@ class DataExplorer:
                 "  (Skipped target correlations — display unavailable)"
             )
 
+        try:
+            self.plot_scatter()
+            results["scatter_matrix"] = "completed"
+        except Exception:  # noqa: BLE001
+            results["scatter_matrix"] = "skipped"
+            self._print("  (Skipped scatter matrix due to an error)")
+
+        if self.target_col and self.target_col in self.df.columns:
+            try:
+                self.plot_scatter_vs_target()
+                results["scatter_vs_target"] = "completed"
+            except Exception:  # noqa: BLE001
+                results["scatter_vs_target"] = "skipped"
+                self._print("  (Skipped scatter-vs-target due to an error)")
+        else:
+            results["scatter_vs_target"] = None
+
+        try:
+            self.generate_sweetviz_report()
+            results["sweetviz_report"] = "completed"
+        except Exception:  # noqa: BLE001
+            results["sweetviz_report"] = "skipped"
+            self._print("  (Skipped Sweetviz report due to an error)")
+
         results["alert_summary"] = self.generate_alert_summary()
+        try:
+            results["pipeline_summary"] = self.get_pipeline_summary()
+        except Exception:  # noqa: BLE001
+            results["pipeline_summary"] = {}
+            self._print("  (Could not generate pipeline summary)")
         return results
 
 
